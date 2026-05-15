@@ -1,0 +1,264 @@
+// ============================================================
+// BAKOME GENESIS INDICATOR v1.0
+// TradingView Pine Script v5
+// 0 Erreurs | 0 Warnings | Testé dans l'éditeur Pine
+// SMC/ICT/PA | Order Blocks | FVG | Liquidity Sweeps
+// Développé par BAKOME — Goma, RDC
+// ============================================================
+
+//@version=5
+indicator("BAKOME GENESIS", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=200, max_bars_back=5000)
+
+// ============================================================
+// PARAMÈTRES
+// ============================================================
+ob_lookback     = input.int(20,  "OB Lookback", 5, 100)
+fvg_min_size    = input.float(0.3, "FVG Min Size (ATR)", 0.1, 2.0, 0.1)
+sweep_lookback  = input.int(10,  "Sweep Lookback", 3, 50)
+risk_reward     = input.float(2.0, "Risk/Reward", 1.5, 5.0, 0.5)
+atr_mult        = input.float(1.5, "ATR Multiplier", 1.0, 3.0, 0.1)
+use_session     = input.bool(true, "Session Filter", group="Session")
+london_start    = input.int(8,   "London Start (UTC)", 0, 23, group="Session")
+ny_end          = input.int(17,  "NY End (UTC)", 0, 23, group="Session")
+use_htf         = input.bool(true, "Use HTF Confirmation", group="MTF")
+htf_tf          = input.timeframe("60", "HTF Timeframe", group="MTF")
+bull_clr        = input.color(color.new(#00ff88, 0), "Bullish Color")
+bear_clr        = input.color(color.new(#ff4444, 0), "Bearish Color")
+neut_clr        = input.color(color.new(#ffaa00, 0), "Neutral Color")
+
+// ============================================================
+// CALCULS DE BASE
+// ============================================================
+atr_val  = ta.atr(14)
+atr_now  = atr_val[1]
+ema_fast = ta.ema(close, 34)
+ema_slow = ta.ema(close, 200)
+rsi_val  = ta.rsi(close, 14)
+
+// Tendance
+trend_bull = ema_fast > ema_slow
+trend_bear = ema_fast < ema_slow
+mom_bull   = rsi_val > 55
+mom_bear   = rsi_val < 45
+
+// Session
+hour_now   = hour(time("UTC"))
+in_session = (hour_now >= london_start) and (hour_now <= ny_end)
+session_ok = not use_session or in_session
+
+// HTF
+htf_ema_fast  = request.security(syminfo.tickerid, htf_tf, ta.ema(close, 34))
+htf_ema_slow  = request.security(syminfo.tickerid, htf_tf, ta.ema(close, 200))
+htf_bull      = use_htf ? (htf_ema_fast > htf_ema_slow) : true
+htf_bear      = use_htf ? (htf_ema_fast < htf_ema_slow) : true
+
+// Volume Proxy (simule DOM/Footprint)
+candle_range  = high - low
+buy_vol       = (candle_range > 0) ? (volume * (close - low) / candle_range) : 0
+sell_vol      = (candle_range > 0) ? (volume * (high - close) / candle_range) : 0
+delta_vol     = buy_vol - sell_vol
+
+// ============================================================
+// ORDER BLOCKS
+// ============================================================
+var float   ob_bull_top   = na
+var float   ob_bull_bot   = na
+var int     ob_bull_bar   = na
+var bool    ob_bull_active = false
+
+var float   ob_bear_top   = na
+var float   ob_bear_bot   = na
+var int     ob_bear_bar   = na
+var bool    ob_bear_active = false
+
+// Détection OB Haussier (casse high précédent après bougie baissière)
+if close > high[1] and close[1] < open[1] and not ob_bull_active
+    ob_bull_top    := high[1]
+    ob_bull_bot    := low[1]
+    ob_bull_bar    := bar_index - 1
+    ob_bull_active := true
+
+// Détection OB Baissier (casse low précédent après bougie haussière)
+if close < low[1] and close[1] > open[1] and not ob_bear_active
+    ob_bear_top    := high[1]
+    ob_bear_bot    := low[1]
+    ob_bear_bar    := bar_index - 1
+    ob_bear_active := true
+
+// Invalidation OB si le prix le traverse complètement
+if ob_bull_active and close < ob_bull_bot
+    ob_bull_active := false
+if ob_bear_active and close > ob_bear_top
+    ob_bear_active := false
+
+// ============================================================
+// FVG (FAIR VALUE GAPS)
+// ============================================================
+var float   fvg_bull_high  = na
+var float   fvg_bull_low   = na
+var int     fvg_bull_bar   = na
+var bool    fvg_bull_active = false
+
+var float   fvg_bear_high  = na
+var float   fvg_bear_low   = na
+var int     fvg_bear_bar   = na
+var bool    fvg_bear_active = false
+
+// FVG Haussier (low actuel > high d'il y a 2 barres)
+fvg_size_bull = low - high[2]
+if fvg_size_bull > (atr_now * fvg_min_size) and close > open and not fvg_bull_active
+    fvg_bull_high  := low
+    fvg_bull_low   := high[2]
+    fvg_bull_bar   := bar_index
+    fvg_bull_active := true
+
+// FVG Baissier (high actuel < low d'il y a 2 barres)
+fvg_size_bear = low[2] - high
+if fvg_size_bear > (atr_now * fvg_min_size) and close < open and not fvg_bear_active
+    fvg_bear_high  := low[2]
+    fvg_bear_low   := high
+    fvg_bear_bar   := bar_index
+    fvg_bear_active := true
+
+// Invalidation FVG
+if fvg_bull_active and close < fvg_bull_low
+    fvg_bull_active := false
+if fvg_bear_active and close > fvg_bear_high
+    fvg_bear_active := false
+
+// ============================================================
+// LIQUIDITY SWEEPS
+// ============================================================
+prev_low_sweep  = ta.lowest(low, sweep_lookback)[1]
+prev_high_sweep = ta.highest(high, sweep_lookback)[1]
+
+sweep_bull = low < prev_low_sweep and close > prev_low_sweep and close > open
+sweep_bear = high > prev_high_sweep and close < prev_high_sweep and close < open
+
+// ============================================================
+// SIGNAUX D'ENTRÉE
+// ============================================================
+buy_signal  = trend_bull and htf_bull and session_ok and mom_bull
+sell_signal = trend_bear and htf_bear and session_ok and mom_bear
+
+buy_strong  = buy_signal  and (sweep_bull or ob_bull_active or fvg_bull_active)
+sell_strong = sell_signal and (sweep_bear or ob_bear_active or fvg_bear_active)
+
+// SL / TP
+sl_dist = atr_now * atr_mult
+tp_dist = sl_dist * risk_reward
+
+buy_sl_val = buy_strong  ? close - sl_dist : na
+buy_tp_val = buy_strong  ? close + tp_dist : na
+sell_sl_val = sell_strong ? close + sl_dist : na
+sell_tp_val = sell_strong ? close - tp_dist : na
+
+// ============================================================
+// DESSIN : ORDER BLOCKS (BOXES)
+// ============================================================
+if ob_bull_active
+    box.new(ob_bull_bar, ob_bull_top, bar_index + 20, ob_bull_bot,
+            bgcolor=color.new(bull_clr, 85), border_color=bull_clr,
+            border_width=1, text="OB+", text_color=color.white, text_size=size.small)
+
+if ob_bear_active
+    box.new(ob_bear_bar, ob_bear_top, bar_index + 20, ob_bear_bot,
+            bgcolor=color.new(bear_clr, 85), border_color=bear_clr,
+            border_width=1, text="OB-", text_color=color.white, text_size=size.small)
+
+// ============================================================
+// DESSIN : FVG (BOXES)
+// ============================================================
+if fvg_bull_active
+    box.new(fvg_bull_bar, fvg_bull_high, bar_index + 10, fvg_bull_low,
+            bgcolor=color.new(color.yellow, 70), border_color=color.yellow,
+            border_width=1, text="FVG+", text_color=color.white, text_size=size.small)
+
+if fvg_bear_active
+    box.new(fvg_bear_bar, fvg_bear_high, bar_index + 10, fvg_bear_low,
+            bgcolor=color.new(color.orange, 70), border_color=color.orange,
+            border_width=1, text="FVG-", text_color=color.white, text_size=size.small)
+
+// ============================================================
+// LABELS : SIGNAUX D'ENTRÉE
+// ============================================================
+if buy_strong
+    label.new(bar_index, low,
+              text="🚀 BUY\n━━━━━━━━━\nSL: " + str.tostring(buy_sl_val, "#.##") +
+              "\nTP: " + str.tostring(buy_tp_val, "#.##") +
+              "\nRR: 1:" + str.tostring(risk_reward, "#.#") +
+              "\n━━━━━━━━━\n✅ OB/FVG/Sweep\n✅ HTF Bullish",
+              xloc=xloc.bar_index, yloc=yloc.belowbar,
+              color=color.new(bull_clr, 90), textcolor=color.white,
+              style=label.style_label_up, size=size.small)
+
+if sell_strong
+    label.new(bar_index, high,
+              text="🔻 SELL\n━━━━━━━━━\nSL: " + str.tostring(sell_sl_val, "#.##") +
+              "\nTP: " + str.tostring(sell_tp_val, "#.##") +
+              "\nRR: 1:" + str.tostring(risk_reward, "#.#") +
+              "\n━━━━━━━━━\n✅ OB/FVG/Sweep\n✅ HTF Bearish",
+              xloc=xloc.bar_index, yloc=yloc.abovebar,
+              color=color.new(bear_clr, 90), textcolor=color.white,
+              style=label.style_label_down, size=size.small)
+
+// ============================================================
+// LABELS : LIQUIDITY SWEEPS
+// ============================================================
+if sweep_bull
+    label.new(bar_index, low,
+              text="🧹 SWEEP BULLISH\n━━━━━━━━━\nLiquidité chassée\nRetournement probable\nAttendre OB pour entrer",
+              xloc=xloc.bar_index, yloc=yloc.belowbar,
+              color=color.new(bull_clr, 80), textcolor=color.white,
+              style=label.style_label_center, size=size.small)
+
+if sweep_bear
+    label.new(bar_index, high,
+              text="🧹 SWEEP BEARISH\n━━━━━━━━━\nLiquidité chassée\nRetournement probable\nAttendre OB pour entrer",
+              xloc=xloc.bar_index, yloc=yloc.abovebar,
+              color=color.new(bear_clr, 80), textcolor=color.white,
+              style=label.style_label_center, size=size.small)
+
+// ============================================================
+// LABELS : RETOUR DANS L'OB
+// ============================================================
+if ob_bull_active and low <= ob_bull_top and close > ob_bull_top
+    label.new(bar_index, low,
+              text="🎯 OB TOUCHÉ\n━━━━━━━━━\nEntrée OB Bullish\nSL sous OB\nTP " + str.tostring(close + tp_dist, "#.##"),
+              xloc=xloc.bar_index, yloc=yloc.belowbar,
+              color=color.new(color.green, 90), textcolor=color.white,
+              style=label.style_label_up, size=size.small)
+
+if ob_bear_active and high >= ob_bear_bot and close < ob_bear_bot
+    label.new(bar_index, high,
+              text="🎯 OB TOUCHÉ\n━━━━━━━━━\nEntrée OB Bearish\nSL au-dessus OB\nTP " + str.tostring(close - tp_dist, "#.##"),
+              xloc=xloc.bar_index, yloc=yloc.abovebar,
+              color=color.new(color.red, 90), textcolor=color.white,
+              style=label.style_label_down, size=size.small)
+
+// ============================================================
+// EMA PLOT
+// ============================================================
+plot(ema_fast, "EMA 34", color=color.new(bull_clr, 60), linewidth=1)
+plot(ema_slow, "EMA 200", color=color.new(bear_clr, 60), linewidth=2)
+
+// ============================================================
+// DASHBOARD TABLE
+// ============================================================
+var table dash = table.new(position.bottom_right, 1, 6, bgcolor=color.new(color.black, 85), border_color=color.new(color.gray, 50), border_width=1)
+
+if barstate.islast
+    table.cell(dash, 0, 0, "🔮 BAKOME GENESIS", text_color=color.white, text_size=size.large)
+    table.cell(dash, 0, 1, "━━━━━━━━━━━━━━━", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 0, 2, "📊 Delta: " + str.tostring(delta_vol, "#"), text_color=delta_vol > 0 ? bull_clr : bear_clr, text_size=size.normal)
+    table.cell(dash, 0, 3, "📈 Tendance: " + (trend_bull ? "🟢 BULLISH" : trend_bear ? "🔴 BEARISH" : "⚪ NEUTRE"), text_color=trend_bull ? bull_clr : trend_bear ? bear_clr : neut_clr, text_size=size.normal)
+    table.cell(dash, 0, 4, "⏰ Session: " + (in_session ? "✅ Active" : "❌ Fermée"), text_color=in_session ? bull_clr : bear_clr, text_size=size.normal)
+    table.cell(dash, 0, 5, "━━━━━━━━━━━━━━━", text_color=color.gray, text_size=size.small)
+
+// ============================================================
+// ALERTES
+// ============================================================
+alertcondition(buy_strong,  "🚀 BUY SIGNAL",  "BAKOME GENESIS: Signal ACHAT sur {{ticker}}")
+alertcondition(sell_strong, "🔻 SELL SIGNAL", "BAKOME GENESIS: Signal VENTE sur {{ticker}}")
+alertcondition(sweep_bull,  "🧹 SWEEP BULL",  "BAKOME GENESIS: Sweep haussier sur {{ticker}}")
+alertcondition(sweep_bear,  "🧹 SWEEP BEAR",  "BAKOME GENESIS: Sweep baissier sur {{ticker}}")
